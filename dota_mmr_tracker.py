@@ -29,7 +29,7 @@ else:
 CSV_PATH = os.path.join(BASE_DIR, "mmr_history.csv")
 CONFIG_PATH = os.path.join(BASE_DIR, "mmr_config.json")
 
-APP_VERSION = 13  # увеличивай при каждом релизе, иначе автообновление не сработает
+APP_VERSION = 17  # увеличивай при каждом релизе, иначе автообновление не сработает
 
 # Канал обновлений по умолчанию: друг ничего никуда не вставляет,
 # трекер сам проверяет и предлагает установить новое.
@@ -109,7 +109,19 @@ def apply_theme(root):
 def load_config():
     cfg = {"account_id": "", "last_match_id": 0, "auto": True,
            "scan_region": None, "scan_interval": 15, "scan_on": False,
-           "update_url": DEFAULT_UPDATE_URL, "last_update_check": ""}
+           "update_url": DEFAULT_UPDATE_URL, "last_update_check": "",
+           "accounts": [],  # [{"nick": "...", "id": "123"}]
+           "est_cleared": False}  # True после сброса: кривая/история пустые до ручной проверки
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    # миграция: старый одиночный ID -> профиль "Основной"
+    if not cfg.get("accounts") and cfg.get("account_id"):
+        cfg["accounts"] = [{"nick": "Основной", "id": str(cfg["account_id"])}]
+    return cfg
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -184,6 +196,18 @@ def fetch_wl(account_id):
             return int(data.get("win", 0)), int(data.get("lose", 0))
     except Exception:
         return 0, 0
+
+def fetch_persona(account_id):
+    """Ник из OpenDota-профиля. Возвращает personaname или ''."""
+    url = f"https://api.opendota.com/api/players/{account_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "DotaMMRTracker/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            prof = data.get("profile") or {}
+            return str(prof.get("personaname", "") or "").strip()
+    except Exception:
+        return ""
 
 EST_STEP = 25  # шаг оценки кривой по результатам (±25 за матч)
 
@@ -340,45 +364,41 @@ def ocr_image_to_text(img):
     return " ".join([str(r[1]) for r in res])
 
 def parse_mmr_text(text):
-    """Ищет итоговый MMR 100..30000. Понимает разделители тысяч: '2 315' -> 2315."""
+    """Итоговый MMR 100..30000. Понимает '2 315' -> 2315.
+    Из нескольких чисел предпочитает самое длинное (Рейтинг, а не мелкая статистика)."""
     if not text:
         return None
     clean = re.sub(r"[^\d]", " ", str(text))
     toks = [t for t in clean.split() if t]
     if not toks:
         return None
-    # 1) все цифры подряд (обычный случай: одна группа)
+    cands = []  # (длина, позиция, значение)
+
+    def consider(s, pos):
+        if 3 <= len(s) <= 5:
+            try:
+                v = int(s)
+                if 100 <= v <= 30000:
+                    cands.append((len(s), pos, v))
+            except ValueError:
+                pass
+
     alldigits = "".join(toks)
     if 3 <= len(alldigits) <= 5:
-        try:
-            v = int(alldigits)
-            if 100 <= v <= 30000:
-                return v
-        except ValueError:
-            pass
-    # 2) склейка соседних групп: "2"+"315" -> 2315 (а "12"+"4230"+... пропускаем)
+        consider(alldigits, 0)
     for i in range(len(toks)):
         s = ""
         for j in range(i, min(i + 3, len(toks))):
             s += toks[j]
             if len(s) > 5:
                 break
-            if len(s) >= 3:
-                try:
-                    v = int(s)
-                    if 100 <= v <= 30000:
-                        return v
-                except ValueError:
-                    pass
-    # 3) отдельные токены
-    for tok in toks:
-        try:
-            v = int(tok)
-            if 100 <= v <= 30000:
-                return v
-        except ValueError:
-            continue
-    # 4) слипшиеся длинные строки пополам
+            consider(s, i)
+    for i, tok in enumerate(toks):
+        consider(tok, i)
+    if cands:
+        cands.sort(key=lambda c: (-c[0], c[1]))
+        return cands[0][2]
+    # слипшиеся длинные строки пополам
     m = re.search(r"\d{7,10}", alldigits)
     if m:
         s = m.group(0)
@@ -506,6 +526,7 @@ class App(tk.Tk):
         self.title("Dota 2 MMR Tracker")
         self.geometry("1000x800")
         apply_theme(self)
+        self._fix_clipboard_keys()
         self.rows = load_history()
         self.cfg = load_config()
         self.second_win = None
@@ -542,6 +563,32 @@ class App(tk.Tk):
                 self.after(15000, lambda: self.check_updates(silent=True))
         except Exception:
             pass
+
+    def _fix_clipboard_keys(self):
+        """Ctrl+C/V/X/A во всех полях через keycode — работает в любой раскладке."""
+        def on_key(e):
+            try:
+                if not (int(e.state) & 0x4):  # Ctrl зажат?
+                    return None
+            except Exception:
+                return None
+            kc = int(getattr(e, "keycode", 0) or 0)
+            try:
+                if kc == 67:  # C — копировать
+                    e.widget.event_generate("<<Copy>>")
+                elif kc == 86:  # V — вставить
+                    e.widget.event_generate("<<Paste>>")
+                elif kc == 88:  # X — вырезать
+                    e.widget.event_generate("<<Cut>>")
+                elif kc == 65:  # A — выделить всё
+                    e.widget.select_range(0, "end")
+                else:
+                    return None
+            except Exception:
+                return None
+            return "break"
+        for cls in ("Entry", "TEntry", "TCombobox"):
+            self.bind_class(cls, "<Key>", on_key)
 
     def _auto_loop(self):
         if self.cfg.get("auto") and self.cfg.get("account_id"):
@@ -585,10 +632,22 @@ class App(tk.Tk):
                         command=self.save_account).pack(side="left", padx=8)
         self.lbl_auto = ttk.Label(auto_frame, text="", font=("Segoe UI", 9), foreground=TH_MUTED)
         self.lbl_auto.pack(side="left", padx=8)
-        self.lbl_pending = ttk.Label(self, text="", font=("Segoe UI", 11, "bold"), foreground=TH_GOLD)
-        self.lbl_pending.pack(fill="x", padx=12)
+        # аккаунты: ник -> ID
+        acc_frame = ttk.LabelFrame(self, text="Аккаунт", padding=6)
+        acc_frame.pack(fill="x", padx=10, pady=4)
+        self.cmb_account = ttk.Combobox(acc_frame, width=22, state="readonly")
+        self.cmb_account.pack(side="left", padx=2)
+        self.cmb_account.bind("<<ComboboxSelected>>", lambda e: self.switch_account())
+        ttk.Button(acc_frame, text="＋", width=3, command=self.add_account).pack(side="left", padx=2)
+        ttk.Button(acc_frame, text="✕", width=3, command=self.del_account).pack(side="left", padx=2)
+        ttk.Button(acc_frame, text="↺ Сброс кривой", command=self.reset_curve).pack(side="left", padx=8)
+        self.lbl_acc = ttk.Label(acc_frame, text="", font=("Segoe UI", 9), foreground=TH_MUTED)
+        self.lbl_acc.pack(side="left", padx=8)
+        self._refresh_accounts_ui()
 
         # (блок ShowMMR/GC удален: точные цифры дает сканер, оценку — Dotabuff/OpenDota)
+        self.lbl_pending = ttk.Label(self, text="", font=("Segoe UI", 11, "bold"), foreground=TH_GOLD)
+        self.lbl_pending.pack(fill="x", padx=12)
 
         # Сканер экрана: сам видит цифру MMR, ничего вводить не надо
         scan_frame = ttk.LabelFrame(self, text="Сканер экрана", padding=6)
@@ -664,6 +723,22 @@ class App(tk.Tk):
             return
         self.cfg["account_id"] = acc or ""
         self.cfg["auto"] = bool(self.auto_var.get())
+        # ручной ввод тоже привязываем к никам: совпал — выбрали, нет — перепривязали текущий
+        if acc:
+            accs = self.cfg.get("accounts", [])
+            if not any(str(a.get("id", "")) == acc for a in accs):
+                try:
+                    nick = self.cmb_account.get()
+                except Exception:
+                    nick = ""
+                if nick and nick != "＋ Добавить…":
+                    for a in accs:
+                        if a["nick"] == nick:
+                            a["id"] = acc
+                else:
+                    accs.append({"nick": f"ID {acc}", "id": acc})
+                self.cfg["accounts"] = accs
+            self._refresh_accounts_ui()
         save_config(self.cfg)
         self.lbl_auto.config(text=f"ID: {acc} сохранен" if acc else "ID очищен")
         if acc:
@@ -673,14 +748,18 @@ class App(tk.Tk):
         acc = self.cfg.get("account_id", "")
         if not acc:
             if not silent:
-                messagebox.showinfo("Нет ID", "Сначала вставь Account ID или ссылку на профиль.")
+                messagebox.showinfo("Нет ID", "Сначала добавь аккаунт (кнопка ＋).")
             return
+        if not silent:
+            # ручная проверка снимает скрытие после сброса
+            self.cfg["est_cleared"] = False
+            save_config(self.cfg)
         self.lbl_auto.config(text="Проверяю OpenDota…")
         threading.Thread(target=self._fetch_worker, args=(acc, silent), daemon=True).start()
 
     def _fetch_worker(self, acc, silent):
         matches, err = fetch_recent_matches(acc, limit=10)
-        hist, herr = fetch_match_history(acc, limit=100)
+        hist, herr = fetch_match_history(acc, limit=20)
         win, lose = fetch_wl(acc)
         if herr:
             hist = []
@@ -690,6 +769,8 @@ class App(tk.Tk):
         """Отрисовать последние 10 матчей + подставить изменение MMR из истории."""
         for i in self.tree.get_children():
             self.tree.delete(i)
+        if self.cfg.get("est_cleared") and not self.rows:
+            return  # после сброса — пусто до ручной проверки
         if not self.last_fetched:
             return
         cmap = match_id_to_change(self.rows)
@@ -885,7 +966,7 @@ class App(tk.Tk):
         if val is None:
             self.scan_last_raw = None
             self.scan_stable = 0
-            self.lbl_scan.config(text=f"Не вижу цифр ({(text or '—')[:30]}). Открой профиль Dota с MMR.")
+            self.lbl_scan.config(text=f"Не вижу цифр ({(text or '—')[:30]}). Открой профиль Dota с Рейтингом.")
             return
         if val == self.scan_last_raw:
             self.scan_stable += 1
@@ -893,8 +974,9 @@ class App(tk.Tk):
             self.scan_last_raw = val
             self.scan_stable = 1
         current = self.rows[-1]["mmr"] if self.rows else None
-        self.lbl_scan.config(text=f"Вижу: {val} (стабильно {self.scan_stable}/2), у нас: {current}")
-        if self.scan_stable >= 2 and (current is None or val != current):
+        need = 3 if (current is None or (current is not None and abs(val - current) > 500)) else 2
+        self.lbl_scan.config(text=f"Вижу: {val} (стабильно {self.scan_stable}/{need}), у нас: {current}")
+        if self.scan_stable >= need and (current is None or val != current):
             self.scan_stable = 0  # чтобы не дублировать
             self._auto_add_scan(val)
 
@@ -907,9 +989,16 @@ class App(tk.Tk):
             if change == 0:
                 return
             if abs(change) > 500:
-                self.lbl_scan.config(text=f"Пропуск: скачок {change} (похоже на ошибку чтения)")
-                return
-            result = "победа" if change > 0 else "поражение"
+                # большой скачок: не пишем молча, а спрашиваем (чинит неверный старт)
+                if messagebox.askyesno("Сканер",
+                                        f"Вижу {mmr}, у нас {self.rows[-1]['mmr']} (разница {change:+d}).\n"
+                                        f"Принять {mmr} как текущий MMR?"):
+                    change, result = change, "коррекция (скан)"
+                else:
+                    self.lbl_scan.config(text=f"Отклонил {mmr}, жду дальше…")
+                    return
+            else:
+                result = "победа" if change > 0 else "поражение"
         match_id, hero_id, kda = "", "", ""
         if self.pending_matches:
             newest = max(self.pending_matches, key=lambda m: int(m.get("match_id", 0)))
@@ -923,7 +1012,7 @@ class App(tk.Tk):
                 m0 = self.last_fetched[0]
                 match_id, hero_id = newest_id, str(m0.get("hero_id", ""))
                 kda = f"{m0.get('kills', '?')}/{m0.get('deaths', '?')}/{m0.get('assists', '?')}"
-        self.rows.append({"date": now, "mmr": mmr, "change": change, "result": result + " [скан]",
+        self.rows.append({"date": now, "mmr": mmr, "change": change, "result": result,
                           "match_id": match_id, "hero_id": hero_id, "kda": kda})
         save_history(self.rows)
         if self.last_fetched:
@@ -937,6 +1026,118 @@ class App(tk.Tk):
         self.refresh()
         sign = f"+{change}" if change > 0 else str(change)
         self.lbl_scan.config(text=f"✅ Записал {mmr} ({sign}). Продолжаю сканировать…")
+
+    # --- аккаунты: ник -> ID ---
+    def _refresh_accounts_ui(self):
+        accs = self.cfg.get("accounts", [])
+        self.cmb_account["values"] = [a["nick"] for a in accs] + ["＋ Добавить…"]
+        cur = str(self.cfg.get("account_id", ""))
+        sel = ""
+        for a in accs:
+            if str(a.get("id", "")) == cur:
+                sel = a["nick"]
+                break
+        self.cmb_account.set(sel)
+        self.lbl_acc.config(text=f"ID {cur}" if cur else "нет аккаунта")
+
+    def switch_account(self):
+        nick = self.cmb_account.get()
+        if nick == "＋ Добавить…":
+            self.add_account()
+            return
+        for a in self.cfg.get("accounts", []):
+            if a["nick"] == nick:
+                self.cfg["account_id"] = str(a["id"])
+                self.cfg["last_match_id"] = 0
+                save_config(self.cfg)
+                self.pending_matches = []
+                self.last_fetched = []
+                self.est_matches = []
+                try:
+                    self.ent_account.delete(0, "end")
+                    self.ent_account.insert(0, str(a["id"]))
+                except Exception:
+                    pass
+                self._refresh_accounts_ui()
+                self.refresh()
+                self.check_new_matches(silent=False)
+                return
+
+    def add_account(self):
+        from tkinter import simpledialog
+        raw = simpledialog.askstring("Аккаунт", "Только ID или ссылка (Dotabuff/Steam):", parent=self)
+        if not raw:
+            self._refresh_accounts_ui()
+            return
+        acc = parse_account_id(raw)
+        if not acc:
+            messagebox.showinfo("Аккаунт", "Не распозналось. Вставь число или ссылку целиком.")
+            self._refresh_accounts_ui()
+            return
+        self.lbl_acc.config(text="Тяну ник…")
+        threading.Thread(target=self._add_account_worker, args=(acc,), daemon=True).start()
+
+    def _add_account_worker(self, acc):
+        nick = fetch_persona(acc) or f"ID {acc}"
+        self.after(0, lambda: self._add_account_done(acc, nick))
+
+    def _add_account_done(self, acc, nick):
+        accs = self.cfg.get("accounts", [])
+        accs = [a for a in accs if str(a.get("id", "")) != acc and a["nick"] != nick]
+        accs.append({"nick": nick, "id": acc})
+        self.cfg["accounts"] = accs
+        self.cfg["account_id"] = acc
+        self.cfg["last_match_id"] = 0
+        self.cfg["est_cleared"] = False
+        save_config(self.cfg)
+        self.pending_matches = []
+        self.last_fetched = []
+        self.est_matches = []
+        try:
+            self.ent_account.delete(0, "end")
+            self.ent_account.insert(0, acc)
+        except Exception:
+            pass
+        self._refresh_accounts_ui()
+        self.refresh()
+        self.check_new_matches(silent=False)
+
+    def del_account(self):
+        nick = self.cmb_account.get()
+        if not nick or nick == "＋ Добавить…":
+            return
+        if not messagebox.askyesno("Аккаунт", f"Убрать {nick} из списка?"):
+            return
+        self.cfg["accounts"] = [a for a in self.cfg.get("accounts", []) if a["nick"] != nick]
+        if self.cfg["accounts"]:
+            self.cfg["account_id"] = str(self.cfg["accounts"][0]["id"])
+        else:
+            self.cfg["account_id"] = ""
+        self.cfg["last_match_id"] = 0
+        save_config(self.cfg)
+        self.pending_matches = []
+        self.last_fetched = []
+        self.est_matches = []
+        self._refresh_accounts_ui()
+        self.refresh()
+        if self.cfg.get("account_id"):
+            self.check_new_matches(silent=False)
+
+    def reset_curve(self):
+        if not messagebox.askyesno("Сброс кривой",
+                                    "Начать отчет заново?\nКривая и история станут полностью пустыми.\nНовое — только после «Проверить матчи» (20 последних)."):
+            return
+        self.rows = []
+        save_history(self.rows)
+        self.pending_matches = []
+        self.last_fetched = []
+        self.est_matches = []
+        self.wl = {"win": 0, "lose": 0}
+        self.cfg["est_cleared"] = True
+        save_config(self.cfg)
+        self._render_pending()
+        self.refresh()
+        self.lbl_acc.config(text="Сброшено: пусто до «Проверить матчи»")
 
     # --- обновления ---
     def check_updates(self, silent=True):
@@ -1098,7 +1299,7 @@ class App(tk.Tk):
                     sign = f"+{r['change']}" if r["change"] > 0 else str(r["change"])
                     mark = "✅" if r["change"] > 0 else "❌"
                     self.hist_list.insert("end", f"{r['date'][:16]} {prev}→{r['mmr']} ({sign}) {mark}")
-        elif getattr(self, "est_matches", None):
+        elif getattr(self, "est_matches", None) and not self.cfg.get("est_cleared"):
             e = self.est_stats()
             self.lbl_current.config(text="~")
             st = e["last_step"]
@@ -1112,9 +1313,9 @@ class App(tk.Tk):
             self.lbl_stats.config(
                 text=(f"Матчей: {e['games']}  |  W {e['wins']} / L {e['losses']}  |  Винрейт {e['winrate']:.1f}%\n"
                       f"Стрик: {streak_txt}"))
-            # история: оценка по результатам (~)
+            # история: оценка по результатам (~), окно 20
             self.hist_list.delete(0, "end")
-            for m in reversed(self.est_matches[-60:]):
+            for m in reversed(self.est_matches[-20:]):
                 mark = "✅" if m["win"] is True else ("❌" if m["win"] is False else "?")
                 step = f"~+{EST_STEP}" if m["win"] is True else (f"~-{EST_STEP}" if m["win"] is False else "~?")
                 self.hist_list.insert("end", f"{m['date']}  {mark} {step}  ({hero_short(m['hero_id'])})")
@@ -1143,7 +1344,7 @@ class App(tk.Tk):
             vals = [r["mmr"] for r in self.rows[-20:]]
             note, note_color = "точные цифры сканера", "#7f95b3"
             fmt = lambda v: str(v)
-        elif getattr(self, "est_matches", None) and len(self.est_matches) >= 2:
+        elif getattr(self, "est_matches", None) and len(self.est_matches) >= 2 and not self.cfg.get("est_cleared"):
             # окно 20 матчей, якорь — текущий MMR (со сканера), дальше ±25
             win = self.est_matches[-20:]
             anchor = self.rows[-1]["mmr"] if self.rows else None
@@ -1218,7 +1419,7 @@ class App(tk.Tk):
     def update_second_screen(self):
         s = calc_stats(self.rows)
         if not self.rows:
-            e = self.est_stats() if getattr(self, "est_matches", None) else None
+            e = self.est_stats() if getattr(self, "est_matches", None) and not self.cfg.get("est_cleared") else None
             if e and e["games"]:
                 self.s_current.config(text="~")
                 st = e["last_step"]
