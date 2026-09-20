@@ -29,7 +29,11 @@ else:
 CSV_PATH = os.path.join(BASE_DIR, "mmr_history.csv")
 CONFIG_PATH = os.path.join(BASE_DIR, "mmr_config.json")
 
-APP_VERSION = 12  # увеличивай при каждом релизе, иначе автообновление не сработает
+APP_VERSION = 13  # увеличивай при каждом релизе, иначе автообновление не сработает
+
+# Канал обновлений по умолчанию: друг ничего никуда не вставляет,
+# трекер сам проверяет и предлагает установить новое.
+DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/deadr1se/dota-mmr-tracker/main/manifest.json"
 
 # ---------- автообновление ----------
 # Канал = статическая ссылка на manifest.json вида:
@@ -105,7 +109,7 @@ def apply_theme(root):
 def load_config():
     cfg = {"account_id": "", "last_match_id": 0, "auto": True,
            "scan_region": None, "scan_interval": 15, "scan_on": False,
-           "update_url": "", "last_update_check": ""}
+           "update_url": DEFAULT_UPDATE_URL, "last_update_check": ""}
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -936,7 +940,7 @@ class App(tk.Tk):
 
     # --- обновления ---
     def check_updates(self, silent=True):
-        url = (self.cfg.get("update_url") or "").strip()
+        url = (self.cfg.get("update_url") or DEFAULT_UPDATE_URL).strip()
         if not url:
             if silent:
                 return
